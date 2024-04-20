@@ -136,39 +136,58 @@ def convert_examples_to_features(item):
     ori2cur_pos={}
     ori2cur_pos[-1]=(0,0)
     for i in range(len(code_tokens)):
-        ori2cur_pos[i]=(ori2cur_pos[i-1][1],ori2cur_pos[i-1][1]+len(code_tokens[i]))    
-    code_tokens=[y for x in code_tokens for y in x]  
+        ori2cur_pos[i]=(ori2cur_pos[i-1][1],ori2cur_pos[i-1][1]+len(code_tokens[i]))
+    code_tokens=[y for x in code_tokens for y in x]
+    # Masking logic starts here
+    masked_tokens = []
+    labels = []
+    for token in code_tokens:
+        if token not in [tokenizer.cls_token, tokenizer.sep_token, tokenizer.pad_token]:
+            if random.random() < 0.15:
+                masked_tokens.append(tokenizer.mask_token)
+                labels.append(token)
+            else:
+                masked_tokens.append(token)
+                labels.append(tokenizer.pad_token)
+        else:
+            masked_tokens.append(token)
+            labels.append(tokenizer.pad_token)
+    # Masking logic ends here
+    code_tokens = masked_tokens
     #truncating
     code_tokens=code_tokens[:args.code_length+args.data_flow_length-2-min(len(dfg),args.data_flow_length)]
     code_tokens =[tokenizer.cls_token]+code_tokens+[tokenizer.sep_token]
     code_ids =  tokenizer.convert_tokens_to_ids(code_tokens)
+    labels_ids = tokenizer.convert_tokens_to_ids(labels)
     position_idx = [i+tokenizer.pad_token_id + 1 for i in range(len(code_tokens))]
     dfg=dfg[:args.code_length+args.data_flow_length-len(code_tokens)]
     code_tokens+=[x[0] for x in dfg]
     position_idx+=[0 for x in dfg]
     code_ids+=[tokenizer.unk_token_id for x in dfg]
+    labels_ids+=[tokenizer.pad_token_id for x in dfg]
     padding_length=args.code_length+args.data_flow_length-len(code_ids)
     position_idx+=[tokenizer.pad_token_id]*padding_length
-    code_ids+=[tokenizer.pad_token_id]*padding_length    
+    code_ids+=[tokenizer.pad_token_id]*padding_length
+    labels_ids+=[tokenizer.pad_token_id]*padding_length
     #reindex
     reverse_index={}
     for idx,x in enumerate(dfg):
         reverse_index[x[1]]=idx
     for idx,x in enumerate(dfg):
-        dfg[idx]=x[:-1]+([reverse_index[i] for i in x[-1] if i in reverse_index],)    
+        dfg[idx]=x[:-1]+([reverse_index[i] for i in x[-1] if i in reverse_index],)
     dfg_to_dfg=[x[-1] for x in dfg]
     dfg_to_code=[ori2cur_pos[x[1]] for x in dfg]
     length=len([tokenizer.cls_token])
-    dfg_to_code=[(x[0]+length,x[1]+length) for x in dfg_to_code]        
+    dfg_to_code=[(x[0]+length,x[1]+length) for x in dfg_to_code]
     #nl
     nl=' '.join(js['docstring_tokens'])
     nl_tokens=tokenizer.tokenize(nl)[:args.nl_length-2]
     nl_tokens =[tokenizer.cls_token]+nl_tokens+[tokenizer.sep_token]
     nl_ids =  tokenizer.convert_tokens_to_ids(nl_tokens)
     padding_length = args.nl_length - len(nl_ids)
-    nl_ids+=[tokenizer.pad_token_id]*padding_length    
-    
-    return InputFeatures(code_tokens,code_ids,position_idx,dfg_to_code,dfg_to_dfg,nl_tokens,nl_ids,js['url'])
+    nl_ids+=[tokenizer.pad_token_id]*padding_length
+
+    return InputFeatures(code_tokens,code_ids,position_idx,dfg_to_code,dfg_to_dfg,nl_tokens,nl_ids,labels_ids,js['url'])
 
 class TextDataset(Dataset):
     def __init__(self, tokenizer, args, file_path=None,pool=None):
@@ -242,17 +261,17 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train(args, model, tokenizer,pool):
+def train(args, model, tokenizer, pool):
     """ Train the model """
-    #get training dataset
-    train_dataset=TextDataset(tokenizer, args, args.train_data_file, pool)
+    # get training dataset
+    train_dataset = TextDataset(tokenizer, args, args.train_data_file, pool)
     train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,num_workers=4)
-    
-    #get optimizer and scheduler
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,num_training_steps=len(train_dataloader)*args.num_train_epochs)
-    
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
+
+    # get optimizer and scheduler
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=args.adam_epsilon)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=len(train_dataloader) * args.num_train_epochs)
+
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
@@ -264,63 +283,48 @@ def train(args, model, tokenizer,pool):
     logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size//args.n_gpu)
     logger.info("  Total train batch size  = %d", args.train_batch_size)
     logger.info("  Total optimization steps = %d", len(train_dataloader)*args.num_train_epochs)
-    
-    # model.resize_token_embeddings(len(tokenizer))
+
     model.zero_grad()
-    
     model.train()
-    tr_num,tr_loss,best_mrr=0,0,0 
-    for idx in range(args.num_train_epochs): 
-        for step,batch in enumerate(train_dataloader):
-            #get inputs
-            code_inputs = batch[0].to(args.device)  
-            attn_mask = batch[1].to(args.device)
-            position_idx = batch[2].to(args.device)
-            nl_inputs = batch[3].to(args.device)
-            #get code and nl vectors
-            code_vec = model(code_inputs=code_inputs,attn_mask=attn_mask,position_idx=position_idx)
-            nl_vec = model(nl_inputs=nl_inputs)
-            
-            #calculate scores and loss
-            scores=torch.einsum("ab,cb->ac",nl_vec,code_vec)
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(scores, torch.arange(code_inputs.size(0), device=scores.device))
-            
-            #report loss
-            tr_loss += loss.item()
-            tr_num+=1
-            if (step+1)% 100==0:
-                logger.info("epoch {} step {} loss {}".format(idx,step+1,round(tr_loss/tr_num,5)))
-                tr_loss=0
-                tr_num=0
-            
-            #backward
+    tr_loss, logging_loss = 0.0, 0.0
+    global_step = 0
+    for _ in trange(args.num_train_epochs, desc="Epoch"):
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration")
+        for step, batch in enumerate(epoch_iterator):
+            # Activate training mode and clear gradients
+            model.train()
+            batch = tuple(t.to(args.device) for t in batch)
+            inputs = {'input_ids':      batch[0],
+                      'attention_mask': batch[1],
+                      'position_ids':   batch[2],
+                      'labels':         batch[4]}
+            outputs = model(**inputs)
+            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+
+            # Backpropagate error and update weights
             loss.backward()
+            tr_loss += loss.item()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step() 
-            
-        #evaluate    
-        results = evaluate(args, model, tokenizer,args.eval_data_file, pool, eval_when_training=True)
-        for key, value in results.items():
-            logger.info("  %s = %s", key, round(value,4))    
-            
-        #save best model
-        if results['eval_mrr']>best_mrr:
-            best_mrr=results['eval_mrr']
-            logger.info("  "+"*"*20)  
-            logger.info("  Best mrr:%s",round(best_mrr,4))
-            logger.info("  "+"*"*20)                          
+            scheduler.step()  # Update learning rate schedule
+            model.zero_grad()
+            global_step += 1
 
-            checkpoint_prefix = 'checkpoint-best-mrr'
-            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)                        
-            model_to_save = model.module if hasattr(model,'module') else model
-            output_dir = os.path.join(output_dir, '{}'.format('model.bin')) 
-            torch.save(model_to_save.state_dict(), output_dir)
-            logger.info("Saving model checkpoint to %s", output_dir)
+            # Log loss
+            if args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                logger.info("  global_step = %s, average loss = %s", global_step, (tr_loss - logging_loss) / args.logging_steps)
+                logging_loss = tr_loss
+
+            # Save model checkpoint
+            if args.save_steps > 0 and global_step % args.save_steps == 0:
+                output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+                model_to_save.save_pretrained(output_dir)
+                logger.info("Saving model checkpoint to %s", output_dir)
+
+    return global_step, tr_loss / global_step
 
 
 def evaluate(args, model, tokenizer,file_name,pool, eval_when_training=False):
@@ -410,32 +414,32 @@ def main():
     parser.add_argument("--test_data_file", default=None, type=str,
                         help="An optional input test data file to test the MRR(a josnl file).")
     parser.add_argument("--codebase_file", default=None, type=str,
-                        help="An optional input test data file to codebase (a jsonl file).")  
-    
+                        help="An optional input test data file to codebase (a jsonl file).")
+
     parser.add_argument("--lang", default=None, type=str,
-                        help="language.")  
-    
+                        help="language.")
+
     parser.add_argument("--model_name_or_path", default=None, type=str,
                         help="The model checkpoint for weights initialization.")
     parser.add_argument("--config_name", default="", type=str,
                         help="Optional pretrained config name or path if not the same as model_name_or_path")
-    parser.add_argument("--tokenizer_name", default="", type=str,
+    parser.add_argument("--tokenizer_name", default=None, type=str,
                         help="Optional pretrained tokenizer name or path if not the same as model_name_or_path")
-    
+
     parser.add_argument("--nl_length", default=128, type=int,
-                        help="Optional NL input sequence length after tokenization.")    
+                        help="Optional NL input sequence length after tokenization.")
     parser.add_argument("--code_length", default=256, type=int,
-                        help="Optional Code input sequence length after tokenization.") 
+                        help="Optional Code input sequence length after tokenization.")
     parser.add_argument("--data_flow_length", default=64, type=int,
-                        help="Optional Data Flow input sequence length after tokenization.") 
-    
+                        help="Optional Data Flow input sequence length after tokenization.")
+
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--do_test", action='store_true',
-                        help="Whether to run eval on the test set.")  
-    
+                        help="Whether to run eval on the test set.")
+
 
     parser.add_argument("--train_batch_size", default=4, type=int,
                         help="Batch size for training.")
@@ -450,12 +454,12 @@ def main():
 
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
-    
+
     pool = multiprocessing.Pool(cpu_cont)
-    
+
     #print arguments
     args = parser.parse_args()
-    
+
     #set log
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',level=logging.INFO )
@@ -464,18 +468,20 @@ def main():
     args.n_gpu = torch.cuda.device_count()
     args.device = device
     logger.info("device: %s, n_gpu: %s",device, args.n_gpu)
-    
+
     # Set seed
     set_seed(args.seed)
 
     #build model
     config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
+    if args.tokenizer_name is None:
+        args.tokenizer_name = args.model_name_or_path
     tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name)
-    model = RobertaModel.from_pretrained(args.model_name_or_path)    
+    model = RobertaModel.from_pretrained(args.model_name_or_path)
     model=Model(model)
     logger.info("Training/evaluation parameters %s", args)
     model.to(args.device)
-    
+
     # Training
     if args.do_train:
         train(args, model, tokenizer, pool)
@@ -484,18 +490,18 @@ def main():
     results = {}
     if args.do_eval:
         checkpoint_prefix = 'checkpoint-best-mrr/model.bin'
-        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
-        model.load_state_dict(torch.load(output_dir),strict=False)      
+        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+        model.load_state_dict(torch.load(output_dir),strict=False)
         model.to(args.device)
         result=evaluate(args, model, tokenizer,args.eval_data_file, pool)
         logger.info("***** Eval results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key],4)))
-            
+
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-mrr/model.bin'
-        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
-        model.load_state_dict(torch.load(output_dir),strict=False)      
+        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
+        model.load_state_dict(torch.load(output_dir),strict=False)
         model.to(args.device)
         result=evaluate(args, model, tokenizer,args.test_data_file, pool)
         logger.info("***** Eval results *****")
@@ -507,5 +513,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
