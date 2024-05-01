@@ -1,0 +1,8 @@
+transformers
+torch==2.2.1
+tree_sitter
+dgl
+pandas
+pydantic
+torch-scatter
+# pip install  dgl -f https://data.dgl.ai/wheels/cu121/repo.html
