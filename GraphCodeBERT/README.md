@@ -17,7 +17,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r ../requirements.txt
 ```
-If you plan to use any of the positional encodings you experiment with, you may want to install the gpu version of dgl.
+If you plan to use any of the positional encodings I experimented with, you may want to install the gpu version of dgl.
 
 [Install dgl](https://www.dgl.ai/pages/start.html)
 
