@@ -49,7 +49,7 @@ I trained the model on 1 P100 GPU. I encourage you to adjust the batch sizes dep
 ```shell
 lang=ruby
 mkdir -p ./saved_models/$lang
-python run.py \
+python run_pretrain.py \
     --output_dir=./saved_models/$lang \
     --config_name=microsoft/graphcodebert-base \
     --model_name_or_path=microsoft/graphcodebert-base \
@@ -74,7 +74,7 @@ python run.py \
 
 ```shell
 lang=ruby
-python run.py \
+python run_pretrain.py \
     --output_dir=./saved_models/$lang \
     --config_name=microsoft/graphcodebert-base \
     --model_name_or_path=microsoft/graphcodebert-base \
