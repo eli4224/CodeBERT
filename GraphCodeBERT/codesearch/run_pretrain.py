@@ -491,20 +491,23 @@ def main():
     # build model
     config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
     tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name)
-    extra_positional_size = 36
     positional_size = 36
+    # When running in standard mode, set this to 0. When running in Concatenation mode, set this to 36.
+    # When using constant positional encoding, this variable isn't used.
+    extra_positional_size = 36
 
     if args.positional in ["random_walk", "laplacian"]:
         # config.hidden_size = config.hidden_size + extra_positional_size
         model = get_reinitialized_roberta(positional_size, extra_positional_size)
         model = ModelPositional(model, tokenizer, positional_size, extra_positional_size, args.positional)
     elif args.positional == "constant":
+        config = RobertaConfig.from_pretrained(args.config_name) if args.config_name else None
         # Use this line to load the preprocessed model:
         # model = RobertaModel.from_pretrained(args.model_name_or_path)
         # Use this line to load the reinitialized original model:
-        model = Model(get_reinitialized_roberta())
+        model = Model(get_reinitialized_roberta(config))
         # Use this line to use the Delayed Full Attention model:
-        # model = ModelMidAttention(RobertaConfig())
+        # model = ModelMidAttention(config if config is not None else RobertaConfig())
     else:
         raise ValueError(f"Invalid positional encoding type: {args.positional}")
     logger.info("Training/evaluation parameters %s", args)
